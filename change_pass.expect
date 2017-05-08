@@ -1,0 +1,135 @@
+#!/usr/bin/expect
+
+set sh_deep 1
+set specify 0
+##
+# 连接远程主机
+proc do_login {passwd} {
+    set timeout 15
+    set done 1
+    set timeout_case 0
+    while {$done<3} {
+        expect {
+            -re "assword[ ]*:" {
+                send $passwd\r
+                incr done
+            }
+            \[$%>#] {
+                set done 5
+                break
+            }
+            timeout {
+                set done 1
+                switch -- $timeout_case {
+                    1 { send_user "try again ...\n" }
+                    2 { exit 2
+                        expect eof
+                    }
+                }
+                incr timeout_case
+            }
+        }
+    }
+    if {$done==3} {
+        exit 3
+        expect eof
+    }
+}
+##
+# 设置语言环境
+proc set_lang {} {
+    set lang {LANG=C;PS1="doraemon#";export LANG PS1}
+    #set ps1  {PS1="doraemon#";export PS1}
+    send "echo \$SHELL\r"
+    global sh_deep
+    expect {
+        -re "bash|/sh|/ksh" { }
+        -re "csh" {
+            send "sh\r"
+            incr sh_deep
+        }
+    }
+    send $lang\r
+}
+##
+# 执行命令
+proc exec_cmd {cmd} {
+    #set timeout -1
+    expect -re "doraemon#$"
+    send_user "\$cmd: $cmd\n"
+    send $cmd\r
+}
+##
+# 退出
+proc logout {} {
+    global sh_deep
+    while {$sh_deep>0} {
+        send exit\r
+        incr sh_deep -1
+    }
+    expect eof
+}
+##
+# 执行命令
+proc change_pass {curr cmd} {
+    expect {
+        -re "specify"
+        {
+                global specify
+                incr specify 1
+                send \r
+        }
+        -re "current|existing|exist|old|Old"
+        { 
+                send $curr\r
+                exp_continue
+        }
+        -re "New|new"
+        {
+                send $cmd\r
+                exp_continue
+        }
+        -re "successfully|uthentication|changed"
+        {
+                send \r
+        }
+        }
+}
+##
+if {$argc < 4} {
+    send_user "Usage:$argv0 user pass ip newpass\n"
+    exit 1
+}
+set user [lindex $argv 0]
+set pass [lindex $argv 1]
+set ip [lindex $argv 2]
+set new [lindex $argv 3]
+set pass_1 {1pqz#PAZe}
+set pass_2 {2wyx@WYXe}
+set pass_3 {3hwd#HWCe}
+set pass_4 {4zxv$ZXVe}
+set pass_5 {5nmb%NMBe}
+spawn ssh -o StrictHostKeyChecking=no -l $user $ip 
+do_login $pass
+set_lang
+
+set pstr "passwd $user"
+exec_cmd $pstr
+change_pass $pass $pass_1
+if { $specify > 0 } { 
+    set pstr "passwd"
+    exec_cmd $pstr
+    change_pass $pass $pass_1
+}
+exec_cmd $pstr
+change_pass $pass_1 $pass_2
+exec_cmd $pstr
+change_pass $pass_2 $pass_3
+exec_cmd $pstr
+change_pass $pass_3 $pass_4
+exec_cmd $pstr
+change_pass $pass_4 $pass_5
+exec_cmd $pstr
+change_pass $pass_5 $new
+
+logout
