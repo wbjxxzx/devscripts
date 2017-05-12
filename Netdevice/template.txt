@@ -1,0 +1,37 @@
+################################################################
+# [global] 必需,配置相关协议、共同体名、供应商等
+# version  必需，协议版本号，一般是：snmpv2c
+# community 必需，共同体名
+# vendor   可选，供应商
+# category 可选，种类
+# id_to_name 可选，配置ifid是否转为ifname [0:不转换 1:转换]
+################################################################
+[global]
+version=snmpv2c
+community=NFJDitwg
+vendor=cisco
+category=switch
+id_to_name=1
+
+################################################################
+# [kpi] 根据此值确定采集函数等
+# IfId 若指定接口，则所有相关指标都只采集对应接口，其他未配置接口不作采集
+# collcyc 必需,采集频率
+# coll_unit 必需，采集单位
+# oid   oid支持多个
+# type  必需，确定采集方式可选：base|list
+# calculation 取值方式,默认为1
+################################################################
+[IfId]
+collcyc=5
+coll_unit=min
+oid=1.3.6.1.2.1.2.2.1.2
+type=base
+
+[DeviceMemUtil]
+collcyc=15
+coll_unit=min
+oid=.1.3.6.1.4.1.9.9.48.1.1.1.5
+oid=.1.3.6.1.4.1.9.9.48.1.1.1.6
+type=list
+calculation=3

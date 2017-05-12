@@ -9,3 +9,5 @@ filter_bill_id.sh       多个数据库查询id
 monitor_table_change.sh 表内容是否有更新
 tok2json.pl             文件格式转换，伪json
 unload_to_oracle.sh     自动导入数据到oracle
+Netdevice/              网络设备package
+getInfo.pl              网络设备采集
