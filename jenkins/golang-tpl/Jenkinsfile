@@ -1,0 +1,378 @@
+import groovy.json.JsonSlurperClassic
+import groovy.json.JsonOutput
+import org.devops.serializers.PipelineTaskInfo
+
+/*
+    since groovy.json.JsonSlurper return a object cause `Jenkins Pipeline NotSerializableException: groovy.json.internal.LazyMap`
+    use JsonSlurperClassic instead
+*/
+
+
+@Library('global-shared-library@master') _
+
+PipelineTaskInfo pipelineTaskInfo = new PipelineTaskInfo()
+
+pipeline {
+    agent {
+        label 'golang-builder'
+    }
+
+    triggers {
+        GenericTrigger(
+            genericVariables: [
+                [key: 'triggerEventName', value: '$.event_name'],  // push
+                [key: 'triggerBranch', value: '$.ref'],
+                [key: 'triggerBeforeSha', value: '$.before'],
+                [key: 'triggerCurrentSha', value: '$.after'],
+                [key: 'triggerCheckoutSha', value: '$.checkout_sha', defaultValue: 'null'],
+                [key: 'triggerCommitsCount', value: '$.total_commits_count'],
+                [key: 'triggerCommits', value: '$.commits'],
+                [key: 'triggerUserName', value: '$.user_name'],
+                [key: 'triggerUserId', value: '$.user_id'],
+                [key: 'triggerProjectId', value: '$.project_id'],
+                [key: 'triggerUserAlphaName', value: '$.user_username'],
+                [key: 'triggerUserEmail', value: '$.user_email', defaultValue: '-'],
+                [key: 'triggerScmName', value: '$.repository.name'],
+                [key: 'triggerScmHTTPUrl', value: '$.repository.git_http_url'],
+             ],
+            causeString: 'Triggered on $triggerBranch',
+            token: 'sys_devops',
+            printContributedVariables: true,
+            printPostContent: true,
+            silentResponse: false,
+            regexpFilterExpression: 'refs/heads/(feature|hotfix).*',  // 仅触发 feature|hotfix 构建
+            regexpFilterText: '$triggerBranch',  // 如果regexpFilterText参数的值符合regexpFilterExpression参数的正则表达式，则触发执行
+        )
+    }
+
+    environment {
+        // 用户自定义全局变量, 仅支持基础类型: 数字、字符串、布尔, 不支持 groovy 列表、映射
+        C_ENV_HTTP_BASE_URL = 'http://192.168.1.1'
+        SHOULD_BUILD = false
+        C_ENV_SCM_DIR = "code"  // 本次拉取代码的目录
+        C_ENV_BUILD_TARGET_NAME_PATH_MAP = ''  // 需要构建的服务与路径的映射集合
+
+    }
+
+    options {
+        gitLabConnection('jenkins_to_gitlab')
+    }
+
+    stages {
+        stage ('pre_pipeline') {
+            steps {
+                script {
+                    def commitsCount = Integer.parseInt(triggerCommitsCount)
+                    def isAbort = utils.isBranchCreateOrDelete("${triggerBeforeSha}", "${triggerCurrentSha}", commitsCount)
+                    if(isAbort){
+                        currentBuild.result = 'ABORTED'
+                        error "create or delete branch, nothing to do."
+                    }
+                    prePipeline()
+
+                    def shortSha = "${triggerCurrentSha}"[0..6]
+                    def branch = "${triggerBranch}".replace('refs/heads/', '')
+                    def branchType = branch.startsWith('hotfix') ? 'hotfix' : 'feature'
+
+                    pipelineTaskInfo.put('username', "${triggerUserName}")
+                    pipelineTaskInfo.put('userId', "${triggerUserId}")
+                    pipelineTaskInfo.put('authorEmail', "${triggerUserEmail}")
+                    pipelineTaskInfo.put('shortSha', shortSha)
+                    pipelineTaskInfo.put('commitSha', "${triggerCurrentSha}")
+                    pipelineTaskInfo.put('branch', "${branch}")
+                    pipelineTaskInfo.put('category', "push")
+                    pipelineTaskInfo.put('action', "push")
+                    pipelineTaskInfo.put('branchType', branchType)
+                    pipelineTaskInfo.put('sourceBranch', "${branch}")
+                    pipelineTaskInfo.put('targetBranch', "")
+                    pipelineTaskInfo.put('scmName', "${triggerScmName}")
+                    pipelineTaskInfo.put('scmUrl', "${triggerScmHTTPUrl}")
+                    pipelineTaskInfo.put('detailUrl', "${env.JENKINS_URL}blue/organizations/jenkins/${env.JOB_BASE_NAME}/detail/${env.JOB_NAME}/${env.BUILD_NUMBER}/pipeline")
+                   
+                    // 通知用户任务开始
+                    notify.jobStart(pipelineTaskInfo, C_ENV_HTTP_BASE_URL)
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "${triggerBranch}"]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: "${C_ENV_SCM_DIR}"]],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[
+                        credentialsId: 'sys_devops',
+                        url: 'https://gitlab.xxx.com/devops/golang.git'
+                    ]]
+                ])
+            }
+        }
+
+        stage('fetch') {
+            steps {
+                dir("${C_ENV_SCM_DIR}") {
+                    script {
+                        sh 'rm -f ARTIFACT_CI_JOB'
+                        sh 'touch ARTIFACT_CI_JOB'
+                        sh 'echo pwd = `pwd`'
+
+                        // 通过 commit hash 从代码库获取本次修改的文件列表
+                        def changedFiles = utils.getCurChangeFiles("${triggerProjectId}", "${triggerCurrentSha}")
+                        println("changedFiles: ${changedFiles}")
+
+                        // 处理多次本地 commit 的情况, $triggerCommits 是一个 json 格式的字符串
+                        def commits = new JsonSlurperClassic().parseText("${triggerCommits}")
+                        def index = commits.size() - 1
+                        def commitMessage = commits[index].message
+                        triggerUserEmail = commits[index].author.email  // 作者邮箱，方便在消息里提醒
+                        branchUrl = commits[index].url  // 本次提交的 url
+
+                        // 根据本次修改的文件计算需要构建的服务
+                        def changedFileCommaSep = changedFiles.join(',')
+                        println("python3 ci/fetchService.py ARTIFACT_CI_JOB ci/inventory.yaml ${changedFileCommaSep}")
+                        sh "python3 ci/fetchService.py ARTIFACT_CI_JOB ci/inventory.yaml ${changedFileCommaSep}"
+                        def str = readFile('ARTIFACT_CI_JOB')
+                        def sli = str.split('\n')
+                        def value = false
+                        echo "str = ${sli}"
+                        if (sli.length > 0 && sli[0] != '') {
+                            SHOULD_BUILD = true
+                        }
+
+                        def ci_time_st = sh(script: 'git log -1 --pretty=format:"%h,%ad" --date=raw | awk -F, \'{print $2}\'|awk \'{print $1}\'', returnStdout: true).trim()
+                        echo "ci_time_st: $ci_time_st"
+                        def ci_time = sh(script: "date -d@$ci_time_st \"+%Y%m%d%H%M%S\"", returnStdout: true).trim()
+                        echo "ci_time: $ci_time"
+
+                        def current_version = (ci_time + '-' + triggerUserAlphaName + '-' + pipelineTaskInfo.get('branch') + '-' + pipelineTaskInfo.get('shortSha')).replace('/', '-')
+                        sh "echo current_version=$current_version >>  ARTIFACT_CI_JOB"
+
+                        // 本次构建的服务与路径、类型的对应关系
+                        /* cat ARTIFACT_CI_JOB
+                        docker_build_services=guild-management-http-logic,channel-live-stats
+                        check_path=guild-management-http-logic:services/guild-management/guild-management-http-logic/,channel-live-stats:services/channel-live-stats/
+                        guild_management_http_logic_path=services/guild-management/guild-management-http-logic/
+                        guild_management_http_logic_category=default
+                        channel_live_stats_path=services/channel-live-stats/
+                        channel_live_stats_category=channel-live
+                        */
+                        C_ENV_BUILD_TARGET_NAME_PATH_MAP = [:]
+                        for (int i = 0; i < sli.size(); i++) {
+                            def tmpLine = sli[i].split('=')
+                            // 取出 check_path 对应值
+                            if (tmpLine.size() > 1 && tmpLine[0].indexOf('check_path') != -1) {
+                                tmpLine[1].split(',').each {
+                                    def tmp = it.split(':')
+                                    C_ENV_BUILD_TARGET_NAME_PATH_MAP.put(tmp[0], tmp[1])
+                                }
+                            }
+                        }
+                        echo "C_ENV_BUILD_TARGET_NAME_PATH_MAP: ${C_ENV_BUILD_TARGET_NAME_PATH_MAP}"
+
+                        pipelineTaskInfo.put('triggerBranchUrl', "${branchUrl}")
+                        pipelineTaskInfo.put('commitMessage', commitMessage)
+                        pipelineTaskInfo.put('authorEmail', triggerUserEmail)
+
+                    }
+                }
+            }
+        }
+
+        stage('dynamic build') {
+            when {
+                equals expected: true, actual: SHOULD_BUILD
+            }
+            /*
+             * 外部并行，内部串行
+             */
+            steps {
+                script {
+                    def jobs = [:]
+                    def image_repo = sh(script: "grep -w 'IMAGE_REGISTRY' $WORKSPACE/ci_tools/env_common.sh|awk -F '\"' '{print \$2}'", returnStdout: true).trim()
+                    C_ENV_SERVICES_INFO_MAP = [:]
+                    C_ENV_UNITTEST_RESULT = ''
+                    C_ENV_SONAR_RESULT_MD = ''
+                    C_ENV_BUILD_TARGET_NAME_PATH_MAP.each { key, val ->
+                        def name = key
+                        def path = val
+                        def appInfoMap = [:]
+                        def buildExitCode = 0
+                        appInfoMap.put('name', name)
+                        appInfoMap.put('pipelineId', LIB_ENV_PEPELINE_ID)
+                        appInfoMap.put('projectKey', "golang:${name}")
+                        println("appInfoMap: ${appInfoMap}")
+                        C_ENV_SERVICES_INFO_MAP.put(name, appInfoMap)
+                        jobs["${name}"] = {
+                            stage("${name}"){
+                                // 出错时阶段标记为失败，后续步骤继续执行
+                                catchError(stageResult: 'FAILURE') {
+                                    stage("Build ${name}") {
+                                        dir("${C_ENV_SCM_DIR}") {
+                                            script {
+                                                buildExitCode = sh(script: "bash ${WORKSPACE}/ci_tools/build.sh ${name}", returnStatus: true)
+                                                if(buildExitCode == 0){
+                                                    C_ENV_SERVICES_INFO_MAP.get(name).put('version', "${image_repo}/testing/${name}:${current_version}")
+                                                    C_ENV_SERVICES_INFO_MAP.get(name).put('pipeline_result', 'SUCCESS')
+                                                }
+                                                else{
+                                                    C_ENV_SERVICES_INFO_MAP.get(name).put('pipeline_result', 'FAILURE')
+                                                    error "${name} build failed"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                stage('Unit Test') {
+                                    // 出错时阶段标记为失败，后续步骤继续执行
+                                    catchError(stageResult: 'FAILURE') {
+                                        dir("${C_ENV_SCM_DIR}") {
+                                            script {
+                                                if(buildExitCode != 0){
+                                                    error "${name} build failed"
+                                                }
+                                                try {
+                                                    sh "go test -gcflags=-l -coverpkg=./${path}... -coverprofile=./${path}coverage.data -timeout=60s ./${path}..."
+                                                    sh "go tool cover -func=./${path}coverage.data -o ./${path}coverage.txt"
+                                                    sh "cat ./${path}coverage.txt"
+                                                    def cover_percent = sh(script: "awk 'END {print}' ./$path/coverage.txt |grep total|awk -F ' ' '{print \$3}'|tr -d '%'", returnStdout: true).trim()
+                                                    echo "$name: $cover_percent%"
+                                                    C_ENV_UNITTEST_RESULT = "${C_ENV_UNITTEST_RESULT}${name}:${cover_percent}%,"
+                                                    //sh "awk 'END {print}' ./$path/coverage.txt |grep total|awk -F ' ' '{print \$3}'"
+                                                    C_ENV_SERVICES_INFO_MAP.get(name).put('unittest_coverage', cover_percent)
+                                                } catch(Exception e){
+                                                    C_ENV_UNITTEST_RESULT = "${C_ENV_UNITTEST_RESULT}${name}:failed,"
+                                                    error '本次单元测试异常'
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                stage('SonarQube Analysis') {
+                                    // 出错时阶段标记为失败，后续步骤继续执行
+                                    catchError(stageResult: 'FAILURE') {
+                                        dir("${C_ENV_SCM_DIR}") {
+                                            script {
+                                                if(buildExitCode != 0){
+                                                    error "${name} build failed"
+                                                }
+                                                try {
+                                                    sh 'echo pwd = `pwd`'
+                                                    sh "golangci-lint run --out-format checkstyle ${WORKSPACE}/${C_ENV_SCM_DIR}/${path}... > ${WORKSPACE}/${C_ENV_SCM_DIR}/${path}/report.xml || true"
+                                                } catch (Exception e){
+                                                    echo 'golangci-lint error'
+                                                }
+                                                //sh "source ci/FETCH_CI_JOB"
+                                                def scannerHome = tool 'default-scanner'
+                                                withSonarQubeEnv('GlobalSonarQube') {// If you have configured more than one global server connection, you can specify its name
+                                                    echo "WORKSPACE: ${WORKSPACE}"
+                                                    echo "scannerHome: ${scannerHome}"
+                                                    // 通过 -Dsonar.scanner.metadataFilePath 指定输出文件(需要为绝对路径), 方便后续获取 taskId 和 质量数据
+                                                    sh "${scannerHome}/bin/sonar-scanner \
+                                                                        -Dsonar.projectKey=golang:${name} \
+                                                                        -Dsonar.sources=${path} \
+                                                                        -Dsonar.working.directory=${path}/.${name} \
+                                                                        -Dsonar.scanner.metadataFilePath=${WORKSPACE}/${C_ENV_SCM_DIR}/${path}/report-task.txt \
+                                                                        -Dsonar.go.coverage.reportPaths=${WORKSPACE}/${C_ENV_SCM_DIR}/${path}/coverage.data \
+                                                                        -Dsonar.go.golangci-lint.reportPaths=${WORKSPACE}/${C_ENV_SCM_DIR}/${path}/report.xml \
+                                                                        -Dsonar.exclusions=**/*_test.go,**/bin/**,**/ci/**,**/cmd/**,**/doc/**,**/kubernetes/**,**/protocol/**,**/tools/**,**/tool/**,**/*.pb.go"
+
+                                                    C_ENV_SONAR_RESULT_MD="${C_ENV_SONAR_RESULT_MD}[${name}](http://yw-sonar-dev.xxx.com:9000/dashboard?id=golang%3A${name}),"
+                                                    def propsFileLines = readFile("${WORKSPACE}/${C_ENV_SCM_DIR}/${path}/report-task.txt").split("\n")
+                                                    sh "ls ${WORKSPACE}/${C_ENV_SCM_DIR}/${path}/report-task.txt"
+                                                    propsFileLines.each { line ->
+                                                        def tmp = line.split('=', 2)
+                                                        C_ENV_SERVICES_INFO_MAP.get(name).put(tmp[0], tmp[1])
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    parallel jobs
+                }
+            }
+        }
+
+        stage('Upload scnner info') {
+            when {
+                equals expected: true, actual: SHOULD_BUILD
+            }
+            steps {
+                script{
+                    pipelineTaskInfo.put('unittestResult', C_ENV_UNITTEST_RESULT)
+                    pipelineTaskInfo.put('sonarResult', C_ENV_SONAR_RESULT_MD)
+                    // 上报扫描数据
+                    C_ENV_SERVICES_INFO_MAP.each {name, sonarInfo ->
+                        echo "sonarInfo: ${sonarInfo}"
+                        if(sonarInfo.get('pipeline_result') == 'SUCCESS'){
+                            httpRequest contentType: 'APPLICATION_JSON_UTF8',
+                                consoleLogResponseBody: false,
+                                httpMode: 'POST',
+                                responseHandle: 'NONE',
+                                timeout: 10,
+                                url: "${C_ENV_HTTP_BASE_URL}/pipeline/analyzer/",
+                                requestBody: JsonOutput.toJson(sonarInfo)
+                        }
+                    }
+                }
+            }
+        }
+
+
+        stage('Upload To Repository') {
+            steps {
+                sh 'echo "upload to repository"'
+            }
+        }
+
+    }
+
+    post {
+        always {
+            script {
+                if(currentBuild.result != 'ABORTED'){
+                    
+                    C_ENV_SERVICES_INFO_MAP.each {name, info ->
+                        def appInfoMap = [:]
+                        def pipeline_result = info.get('pipeline_result') ? info.get('pipeline_result') : currentBuild.currentResult
+                        appInfoMap.put('app_name', "${name}")
+                        appInfoMap.put('pipeline_id', LIB_ENV_PEPELINE_ID)
+                        appInfoMap.put('app_key', "${info.projectKey}")
+                        appInfoMap.put('user_email', pipelineTaskInfo.get('authorEmail'))
+                        appInfoMap.put('start_timestamp', currentBuild.startTimeInMillis / 1000)
+                        appInfoMap.put('pipeline_result', pipeline_result)
+                        appInfoMap.put('duration', currentBuild.duration / 1000)
+                        httpRequest contentType: 'APPLICATION_JSON_UTF8',
+                                consoleLogResponseBody: true,
+                                httpMode: 'POST',
+                                responseHandle: 'NONE',
+                                timeout: 10,
+                                url: "${C_ENV_HTTP_BASE_URL}/pipeline/build/",
+                                requestBody: JsonOutput.toJson(appInfoMap)
+                    }
+
+                    utils.sendJobResult(pipelineTaskInfo, C_ENV_HTTP_BASE_URL)
+                    notify.jobFinish(pipelineTaskInfo)
+                }
+            }
+        }
+        failure {
+            updateGitlabCommitStatus name: 'build', state: 'failed'
+            addGitLabMRComment comment: 'Something unexpected happened. Please inspect Jenkins logs.'
+        }
+        success {
+            updateGitlabCommitStatus name: 'build', state: 'success'
+        //             acceptGitLabMR(useMRDescription: true, removeSourceBranch: false)
+        }
+        aborted {
+            updateGitlabCommitStatus name: 'build', state: 'failed'
+            addGitLabMRComment comment: "Merge request ${env.gitlabMergeRequestIid} is failured,Please check jenkins logs"
+        }
+    }
+}
