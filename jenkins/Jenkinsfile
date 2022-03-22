@@ -1,0 +1,503 @@
+import groovy.json.JsonSlurperClassic
+import groovy.json.JsonOutput
+import org.devops.serializers.PipelineTaskInfo
+
+@Library('global-shared-library@master') _
+
+PipelineTaskInfo pipelineTaskInfo = new PipelineTaskInfo()
+
+pipeline {
+    agent {
+        label 'cpp-builder'
+    }
+
+    triggers{
+        GenericTrigger(
+            genericVariables: [
+                [key: 'triggerEventName', value: '$.event_name'],  // push
+                [key: 'triggerBranch', value: '$.ref'],
+                [key: 'triggerBeforeSha', value: '$.before'],
+                [key: 'triggerCurrentSha', value: '$.after'],
+                [key: 'triggerCheckoutSha', value: '$.checkout_sha', defaultValue: 'null'],
+                [key: 'triggerCommitsCount', value: '$.total_commits_count'],
+                [key: 'triggerCommits', value: '$.commits'],
+                [key: 'triggerUserName', value: '$.user_name'],
+                [key: 'triggerUserId', value: '$.user_id'],
+                [key: 'triggerProjectId', value: '$.project_id'],
+                [key: 'triggerUserAlphaName', value: '$.user_username'],
+                [key: 'triggerUserEmail', value: '$.user_email', defaultValue: '-'],
+                [key: 'triggerScmName', value: '$.repository.name'],
+                [key: 'triggerScmHTTPUrl', value: '$.repository.git_http_url'],
+            ],
+            causeString: 'Triggered on $triggerBranch',
+            token: 'cpp_dev',
+            printContributedVariables: true,
+            printPostContent: true,
+            silentResponse: false,
+            regexpFilterExpression: 'refs/heads/(feature|hotfix).*',  // 仅触发 feature|hotfix 构建
+            regexpFilterText: '$triggerBranch',  // 如果regexpFilterText参数的值符合regexpFilterExpression参数的正则表达式，则触发执行
+        )
+    }
+
+    options {
+        //不允许并行构建
+        disableConcurrentBuilds()
+        gitLabConnection('jenkins_to_gitlab')
+        // gitlabBuilds(builds: ['checkout', 'fetch', 'pre_build', 'cppcheck', 'SonarQube Analysis', 'build', 'Unit Test', ])
+    }
+
+    environment {
+        // 用户自定义全局变量, 仅支持基础类型: 数字、字符串、布尔, 不支持 groovy 列表、映射
+        C_ENV_HTTP_BASE_URL = 'http://192.168.1.1'
+        C_ENV_SCM_DIR = "cpp"  // 本次拉取代码的目录
+        SHOULD_BUILD = false
+        C_ENV_BUILD_TARGET_NAME_PATH_MAP = ""  // 需要构建的服务与路径的映射集合
+        C_ENV_SONAR_RESULT_MD = ""  // sonar扫描结果, markdown 格式
+    }
+
+    stages {
+        stage ('pre_pipeline'){
+            steps {
+                script {
+                    def commitsCount = Integer.parseInt(triggerCommitsCount)
+                    def isAbort = utils.isBranchCreateOrDelete("${triggerBeforeSha}", "${triggerCurrentSha}", commitsCount)
+                    if(isAbort){
+                        currentBuild.result = 'ABORTED'
+                        error "create or delete branch, nothing to do."
+                    }
+                    prePipeline()
+
+                    def shortSha = "${triggerCurrentSha}"[0..6]
+                    def branch = "${triggerBranch}".replace('refs/heads/', '')
+                    def branchType = branch.startsWith('hotfix') ? 'hotfix' : 'feature'
+
+                    pipelineTaskInfo.put('username', "${triggerUserName}")
+                    pipelineTaskInfo.put('userId', "${triggerUserId}")
+                    pipelineTaskInfo.put('authorEmail', "${triggerUserEmail}")
+                    pipelineTaskInfo.put('shortSha', shortSha)
+                    pipelineTaskInfo.put('commitSha', "${triggerCurrentSha}")
+                    pipelineTaskInfo.put('branch', "${branch}")
+                    pipelineTaskInfo.put('category', "push")
+                    pipelineTaskInfo.put('action', "push")
+                    pipelineTaskInfo.put('branchType', branchType)
+                    pipelineTaskInfo.put('sourceBranch', "${branch}")
+                    pipelineTaskInfo.put('targetBranch', "")
+                    pipelineTaskInfo.put('scmName', "${triggerScmName}")
+                    pipelineTaskInfo.put('scmUrl', "${triggerScmHTTPUrl}")
+                    pipelineTaskInfo.put('detailUrl', "${env.JENKINS_URL}blue/organizations/jenkins/${env.JOB_BASE_NAME}/detail/${env.JOB_NAME}/${env.BUILD_NUMBER}/pipeline")
+
+                    // 通知用户任务开始
+                    notify.jobStart(pipelineTaskInfo, C_ENV_HTTP_BASE_URL)
+                }
+            }
+        }
+        stage('checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: "${triggerBranch}"]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [
+                        [$class: 'RelativeTargetDirectory', relativeTargetDir: "${C_ENV_SCM_DIR}"]
+                    ],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[
+                        credentialsId: 'sys_devops',
+                        url: 'https://gitlab.xxx.com/devops/cpp.git'
+                    ]]
+                ])
+            }
+        }
+
+        stage('fetch') {
+            steps {
+                dir("${C_ENV_SCM_DIR}"){
+                    script{
+                        // 通过 commit hash 从代码库获取本次修改的文件列表
+                        def changedFiles = utils.getCurChangeFiles("${triggerProjectId}", "${triggerCurrentSha}")
+                        println("changedFiles: ${changedFiles}")
+
+                        // 处理多次本地 commit 的情况, $triggerCommits 是一个 json 格式的字符串
+                        def commits = new JsonSlurperClassic().parseText("${triggerCommits}")
+                        def index = commits.size() - 1
+                        def commitMessage = commits[index].message
+
+                        triggerUserEmail = commits[index].author.email  // 作者邮箱，方便在消息里提醒
+                        branchUrl = commits[index].url  // 本次提交的 url
+
+                        sh "rm -f CI_BUILD_TARGETS"
+                        sh "touch CI_BUILD_TARGETS "
+                        sh "echo pwd = `pwd` "
+                        // 根据本次修改的文件计算需要构建的服务
+                        def changedFileCommaSep = changedFiles.join(',')
+                        sh "python3 ${WORKSPACE}/ci_tools/fetch_service.py CI_BUILD_TARGETS ci/inventory.yaml ${changedFileCommaSep}"
+
+                        pipelineTaskInfo.put('triggerBranchUrl', "${branchUrl}")
+                        pipelineTaskInfo.put('commitMessage', commitMessage)
+                        pipelineTaskInfo.put('authorEmail', triggerUserEmail)
+
+                    }
+                }
+            }
+        }
+
+        stage('pre_build') {
+            steps {
+                dir("${WORKSPACE}"){
+                    sh '[ -d tmp_bin ] || mkdir tmp_bin'
+                }
+                dir("${C_ENV_SCM_DIR}"){
+                    script {
+                        def str = readFile('CI_BUILD_TARGETS')
+                        def sli = str.split('\n')
+
+                        // 本次构建服务与路径、类型对应关系
+                        /* cat CI_BUILD_TARGETS
+                        build_services=account,channel
+                        check_path=account:src/account/,channel:src/channel/
+                        account_path=src/account/
+                        channel_path=src/channel/
+                         */
+                        C_ENV_BUILD_TARGET_NAME_PATH_MAP = [:]
+                        for (int i = 0; i < sli.size(); i++) {
+                            def tmpLine = sli[i].split('=')
+                            // 取出 check_path 对应值
+                            if (tmpLine.size() > 1 && tmpLine[0].indexOf('check_path') != -1) {
+                                tmpLine[1].split(',').each {
+                                    def tmp = it.split(':')
+                                    C_ENV_BUILD_TARGET_NAME_PATH_MAP.put(tmp[0], tmp[1])
+                                }
+                            }
+                        }
+
+                        if (C_ENV_BUILD_TARGET_NAME_PATH_MAP.size() > 0){
+                            SHOULD_BUILD=true
+                        }
+
+                        def ci_time_st = sh (script: "git log -1 --pretty=format:'%h,%ad' --date=raw|awk -F, '{print \$2}'|awk '{print \$1}'", returnStdout: true).trim()
+                        def ci_time= sh (script: "date -d@`git log -1 --pretty=format:'%h,%ad' --date=raw|awk -F, '{print \$2}'|awk '{print \$1}'` '+%Y%m%d%H%M%S'", returnStdout: true).trim()
+                        def branch = pipelineTaskInfo.get('branch').replace('/', '-')
+                        cur_version = "V${ci_time}-${triggerUserAlphaName}-${branch}-" + pipelineTaskInfo.get('shortSha')
+                        echo "cur_version: ${cur_version}"
+
+                        // append ci vars
+                        sh "echo author=${triggerUserAlphaName} >> CI_BUILD_TARGETS"
+                        sh "echo cur_version=${cur_version} >> CI_BUILD_TARGETS"
+                        sh "echo BUILD_VERSION=${cur_version} >> CI_BUILD_TARGETS"
+                        // sh "echo BUILD_DIRECTORY_ABS=./${check_path} >> CI_BUILD_TARGETS"
+                        sh "cat CI_BUILD_TARGETS"
+
+                        C_ENV_SERVICES_INFO_MAP = [:]
+                        C_ENV_SONAR_RESULT_MD = ''
+                    }
+                }
+            }
+        }
+
+        stage('dynamic build') {
+            when {
+                equals expected: true, actual: SHOULD_BUILD
+            }
+            /*
+             * 外部并行，内部串行
+             */
+            steps {
+                script {
+                    def services = C_ENV_BUILD_TARGET_NAME_PATH_MAP.keySet().collect()  // 字典转换为数组
+                    def parallelLimit = 4  // 最大并行限制
+                    def nLimits = Math.ceil((float)services.size() / parallelLimit)  // 需要几个 parallelLimit 并行， (float)强制类型转换为必须, 否则会报错
+                    for(int index=0; index < nLimits; index++){
+                        stage("build-${index}"){
+                            def jobs = [:]
+                            for(int j=0; j < parallelLimit; j++){
+                                def idx = index * parallelLimit + j
+                                if(idx >= services.size()){  // 超出数组范围
+                                    break
+                                }
+                                def preIndex = index  // 是否需要 checkout 代码
+                                def suffix = j  // 闭包，保存变量值
+                                def appInfoMap = [:]
+                                def name = services[idx]
+                                def path = C_ENV_BUILD_TARGET_NAME_PATH_MAP.get(name)
+                                appInfoMap.put('name', name)
+                                appInfoMap.put('pipelineId', LIB_ENV_PEPELINE_ID)
+                                appInfoMap.put('projectKey', "cpp:${name}")
+                                println("appInfoMap: ${appInfoMap}")
+                                C_ENV_SERVICES_INFO_MAP.put(name, appInfoMap)
+
+                                def buildExitCode = 0
+                                
+                                jobs["${name}"] = {
+                                    stage("${name}"){
+                                        stage("Build ${name}") {
+                                            // 出错时阶段标记为失败，后续步骤继续执行
+                                            catchError(stageResult: 'FAILURE') {
+                                                script {
+                                                    def _dir = suffix > 0 ? "${C_ENV_SCM_DIR}${suffix}" : "${C_ENV_SCM_DIR}"
+                                                    if(preIndex == 0 && suffix != 0){
+                                                        checkoutSCM(_dir)
+                                                        sh "cp ${WORKSPACE}/${C_ENV_SCM_DIR}/CI_BUILD_TARGETS ${WORKSPACE}/${C_ENV_SCM_DIR}${suffix}/CI_BUILD_TARGETS"
+                                                    }
+                                                    buildExitCode = sh(script: "docker run -u root --rm -w /cpp \
+                                                        -e TERM=xterm \
+                                                        -e OUTPUT_FILE=/tmp_bin/${name}.tgz \
+                                                        -e BUILD_TARGET=${name} \
+                                                        -e CI_PROJECT_DIR=/cpp \
+                                                        -e BUILD_DIRECTORY_ABS=${path} \
+                                                        -v ${WORKSPACE}/${_dir}:/cpp \
+                                                        -v ${WORKSPACE}/tmp_bin:/tmp_bin \
+                                                        registry.xxx.com/library/cpp-builder:centos6.5 \
+                                                        ./ci/do_gitlab_ci_build_binary.sh", returnStatus: true)
+
+                                                    C_ENV_SERVICES_INFO_MAP.get(name).put('pipeline_result', 'SUCCESS')
+                                                    if(buildExitCode != 0){
+                                                        C_ENV_SERVICES_INFO_MAP.get(name).put('pipeline_result', 'FAILURE')
+                                                        error "${name} build failed"
+                                                    }
+                                                    else{
+                                                        C_ENV_SERVICES_INFO_MAP.get(name).put('pipeline_result', 'SUCCESS')
+                                                        // 采用 代码库/服务名/版本/文件名 存储制品
+                                                        def obs_path = "${triggerScmName}/${name}/${cur_version}.tgz"
+                                                        echo "/usr/bin/obsutil cp ${WORKSPACE}/tmp_bin/${name}.tgz obs://yw-cicd/${obs_path}"
+                                                        sh "/usr/bin/obsutil cp ${WORKSPACE}/tmp_bin/${name}.tgz obs://yw-cicd/${obs_path}"
+                                                        C_ENV_SERVICES_INFO_MAP.get(name).put('path', "${obs_path}")
+                                                        C_ENV_SERVICES_INFO_MAP.get(name).put('version', "${cur_version}")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                            }
+                            parallel jobs
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('dynamic cppcheck') {
+            when {
+                equals expected: true, actual: SHOULD_BUILD
+            }
+            agent {
+                docker {
+                    image 'registry.xxx.com/ops/cppcheck:2.4'
+                    reuseNode true
+                }
+            }
+            /*
+             * 外部并行，内部串行
+             */
+            steps {
+                script {
+                    def jobs = [:]
+                    C_ENV_BUILD_TARGET_NAME_PATH_MAP.each { key, val ->
+                        def name = key
+                        def path = val
+                        jobs["${name}"] = {
+                            stage("${name}"){
+                                stage('Unit Test') {
+                                    script {
+                                        echo 'ok'
+                                    }
+                                }
+
+                                stage('cppcheck') {
+                                    // 出错时阶段标记为失败，后续步骤继续执行
+                                    catchError(stageResult: 'FAILURE') {
+                                        dir("${C_ENV_SCM_DIR}"){
+                                            script {
+                                                if(C_ENV_SERVICES_INFO_MAP.get(name, [:]).get('pipeline_result') != 'SUCCESS'){
+                                                    error "${name} build failed"
+                                                }
+                                                sh "/usr/bin/cppcheck --xml --xml-version=2 --enable=all ./${path} 2> ./${path}/cppcheck-report.xml"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    parallel jobs
+                }
+            }
+        }
+
+        stage('dynamic SonarQube analysis') {
+            when {
+                equals expected: true, actual: SHOULD_BUILD
+            }
+            /*
+             * 外部并行，内部串行
+             */
+            steps {
+                script {
+                    def jobs = [:]
+                    C_ENV_SONAR_RESULT_MD = ''
+                    C_ENV_BUILD_TARGET_NAME_PATH_MAP.each { key, val ->
+                        def name = key
+                        def path = val
+                        jobs["${name}"] = {
+                            stage("${name}"){
+                                stage('SonarQube analysis') {
+                                    // 出错时阶段标记为失败，后续步骤继续执行
+                                    catchError(stageResult: 'FAILURE') {
+                                        dir("${C_ENV_SCM_DIR}"){
+                                            script {
+                                                if(C_ENV_SERVICES_INFO_MAP.get(name, [:]).get('pipeline_result') != 'SUCCESS'){
+                                                    error "${name} build failed"
+                                                }
+                                                def scannerHome = tool 'default-scanner'
+                                                withSonarQubeEnv('GlobalSonarQube') { // If you have configured more than one global server connection, you can specify its name
+                                                    dir("${WORKSPACE}/${C_ENV_SCM_DIR}/${path}"){
+                                                        sh "${scannerHome}/bin/sonar-scanner \
+                                                            -Dsonar.projectKey=cpp:${name} \
+                                                            -Dsonar.projectName=${name} \
+                                                            -Dsonar.scanner.metadataFilePath=${WORKSPACE}/${C_ENV_SCM_DIR}/${path}/report-task.txt \
+                                                            -Dsonar.exclusions=**/*.java \
+                                                            -Dsonar.working.directory=.${name} \
+                                                            -Dsonar.sources=."
+                                                    }
+                                                    C_ENV_SONAR_RESULT_MD="${C_ENV_SONAR_RESULT_MD}[${name}](http://yw-sonar-dev.xxx.com:9000/dashboard?id=cpp%3A${name}),"
+                                                }
+                                                dir("${WORKSPACE}/${C_ENV_SCM_DIR}/${path}"){
+                                                    def propsFileLines = readFile("report-task.txt").split("\n")
+                                                    sh "ls report-task.txt"
+                                                    propsFileLines.each { line ->
+                                                        def tmp = line.split('=', 2)
+                                                        C_ENV_SERVICES_INFO_MAP.get(name).put(tmp[0], tmp[1])
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    parallel jobs
+                }
+            }
+        }
+
+        stage('Upload scnner info') {
+            when {
+                equals expected: true, actual: SHOULD_BUILD
+            }
+            steps {
+                script{
+                    pipelineTaskInfo.put('sonarResult', C_ENV_SONAR_RESULT_MD)
+                    // 上报扫描数据
+                    C_ENV_SERVICES_INFO_MAP.each {name, sonarInfo ->
+                        echo "sonarInfo: ${sonarInfo}"
+                        if(sonarInfo.get('pipeline_result') == 'SUCCESS'){
+                            httpRequest contentType: 'APPLICATION_JSON_UTF8',
+                                consoleLogResponseBody: false,
+                                httpMode: 'POST',
+                                responseHandle: 'NONE',
+                                timeout: 30,
+                                url: "${C_ENV_HTTP_BASE_URL}/pipeline/analyzer/",
+                                requestBody: JsonOutput.toJson(sonarInfo)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Upload Artifact') {
+            steps {
+                dir("${WORKSPACE}/tmp_bin"){
+                    script {
+                        C_ENV_BUILD_TARGET_NAME_PATH_MAP.each {name, path ->
+                            // 采用 代码库/服务名/版本/文件名 存储制品
+                            def obs_path = "${triggerScmName}/${name}/${cur_version}.tgz"
+                            echo "/usr/bin/obsutil cp ${name}.tgz obs://yw-devops/${obs_path}"
+                            sh "/usr/bin/obsutil cp ${name}.tgz obs://yw-devops/${obs_path}"
+                            def artifactInfoMap = ["app_name": "${name}", "pipeline_id": LIB_ENV_PEPELINE_ID, "path": "${obs_path}",  "version": "${cur_version}"]
+                            httpRequest contentType: 'APPLICATION_JSON_UTF8',
+                                    consoleLogResponseBody: true,
+                                    httpMode: 'POST',
+                                    responseHandle: 'NONE',
+                                    timeout: 30,
+                                    url: "${C_ENV_HTTP_BASE_URL}/pipeline/artifact/",
+                                    requestBody: JsonOutput.toJson(artifactInfoMap)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('deploy internal development') {
+            when {
+                equals expected: true, actual: SHOULD_BUILD
+            }
+            // 部署内网开发环境
+            steps{
+                script {
+                    echo 'ok'
+                    
+                }
+            }
+        }
+
+    }
+
+    post {
+        always {
+            script {
+                if(currentBuild.result != 'ABORTED'){
+
+                    C_ENV_SERVICES_INFO_MAP.each {name, info ->
+                        def appInfoMap = [:]
+                        def pipeline_result = info.get('pipeline_result') ? info.get('pipeline_result') : currentBuild.currentResult
+                        appInfoMap.put('app_name', "${name}")
+                        appInfoMap.put('pipeline_id', LIB_ENV_PEPELINE_ID)
+                        appInfoMap.put('app_key', "${info.projectKey}")
+                        appInfoMap.put('user_email', pipelineTaskInfo.get('authorEmail'))
+                        appInfoMap.put('start_timestamp', currentBuild.startTimeInMillis / 1000)
+                        appInfoMap.put('pipeline_result', pipeline_result)
+                        appInfoMap.put('duration', currentBuild.duration / 1000)
+                        httpRequest contentType: 'APPLICATION_JSON_UTF8',
+                                consoleLogResponseBody: true,
+                                httpMode: 'POST',
+                                responseHandle: 'NONE',
+                                timeout: 10,
+                                url: "${C_ENV_HTTP_BASE_URL}/pipeline/build/",
+                                requestBody: JsonOutput.toJson(appInfoMap)
+                    }
+
+                    utils.sendJobResult(pipelineTaskInfo, C_ENV_HTTP_BASE_URL)
+                    notify.jobFinish(pipelineTaskInfo)
+                }
+            }
+        }
+        failure {
+            updateGitlabCommitStatus name: 'build', state: 'failed'
+        }
+        success {
+            updateGitlabCommitStatus name: 'build', state: 'success'
+        }
+        aborted {
+            updateGitlabCommitStatus name: 'build', state: 'failed'
+        }
+    }
+
+}
+
+def checkoutSCM(_dir){
+    checkout([
+        $class: 'GitSCM',
+        branches: [[name: "${triggerBranch}"]],
+        doGenerateSubmoduleConfigurations: false,
+        extensions: [
+            [$class: 'RelativeTargetDirectory', relativeTargetDir: "${_dir}"]
+        ],
+        submoduleCfg: [],
+        userRemoteConfigs: [[
+            credentialsId: 'sys_devops', 
+            url: 'https://gitlab.xxx.com/devops/cpp.git'
+        ]]
+    ])
+}
